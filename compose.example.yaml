@@ -1,0 +1,21 @@
+# Copy this service into the compose file of any PHP project (paths are relative to that file).
+services:
+  code-map:
+    image: php-code-map:latest
+    # or build straight from a checkout of this repo:
+    # build: ../php-code-map
+    restart: unless-stopped
+    volumes:
+      - ./:/project:ro              # the code to index, read-only
+      - ./.code-map:/out            # generated OVERVIEW.md + namespaces/*.md (add .code-map/ to .gitignore)
+      - code-map-data:/data         # SQLite index, survives restarts
+    environment:
+      CODEMAP_PROJECT_NAME: my-project
+      CODEMAP_INCLUDE: "src"        # comma-separated, relative to the project root
+      CODEMAP_EXCLUDE: ""           # added to the defaults (vendor, var, node_modules, cache, .git, .claude, ...)
+      CODEMAP_POLL_INTERVAL: "5"
+    ports:
+      - "127.0.0.1:8765:8765"       # MCP endpoint: http://localhost:8765/mcp
+
+volumes:
+  code-map-data:

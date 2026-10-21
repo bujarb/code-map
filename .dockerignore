@@ -1,0 +1,6 @@
+vendor
+var
+tests
+.git
+.phpunit.cache
+.code-map

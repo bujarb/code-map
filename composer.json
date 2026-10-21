@@ -1,0 +1,34 @@
+{
+    "name": "codemap/php-code-map",
+    "description": "Indexes a PHP codebase into a queryable symbol graph and exposes it to AI agents via MCP and generated markdown.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4",
+        "ext-pdo_sqlite": "*",
+        "nikic/php-parser": "^5",
+        "mcp/sdk": "^0.9.0",
+        "symfony/console": "^8.1",
+        "symfony/yaml": "^8.1",
+        "nyholm/psr7": "^1.8",
+        "nyholm/psr7-server": "^1.1",
+        "laminas/laminas-httphandlerrunner": "^2.14"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^13.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "CodeMap\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "CodeMap\\Tests\\": "tests/"
+        }
+    },
+    "bin": ["bin/codemap"],
+    "config": {
+        "sort-packages": true
+    }
+}

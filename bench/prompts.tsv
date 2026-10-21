@@ -1,0 +1,6 @@
+# id<TAB>prompt — one task per line, lines starting with # are ignored.
+# The same prompt is sent with and without code-map, so don't mention code-map here.
+lookup	Who calls ActivityFacade::expireOrder? List every caller with file:line.
+routes	List all POST routes whose path starts with /activity, with the controller method handling each.
+explore	How does an activity's status get updated? Describe the call flow from the entry points (routes, message handlers, commands) down to the service that persists it, with file:line references. Keep it under 25 lines.
+impact	I want to add a required parameter to ActivityFacade::expireOrder. What would I have to change? List every affected file:line, including tests.
