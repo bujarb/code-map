@@ -1,0 +1,14 @@
+{
+  "name": "code-map-ts-indexer",
+  "private": true,
+  "description": "TypeScript/TSX extractor for code-map: turns .ts/.tsx files into the same symbols/relations/refs/attributes rows the PHP indexer stores.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/indexer.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "typescript": "6.0.3"
+  }
+}
