@@ -100,12 +100,50 @@ The tool set is deliberately small and each tool tries to answer in one call: ev
 into the agent's context, and every extra round trip re-sends the whole conversation. The `bench/` script
 measures this (see `bench/bench.sh --help`).
 
+## TypeScript / React projects
+
+The same image indexes TypeScript and TSX when `CODEMAP_LANG=ts` (or `auto`, which picks `ts` for a root with a
+`tsconfig.json`/`package.json` and no `composer.json`). Everything except the parser is shared: the polling
+watcher, the SQLite schema, the MCP tools, `codemap query` and the markdown export.
+
+```bash
+docker compose up -d --build code-map-fe       # ../nrg-core/frontend, read-only, MCP on http://localhost:8766/mcp
+docker exec code-map-nrg-fe codemap query index_status
+docker exec code-map-nrg-fe codemap query find_usages Button
+```
+
+Override the mount with `CODEMAP_FE_PROJECT_PATH`, the port with `CODEMAP_FE_PORT`, and the scan scope with
+`CODEMAP_FE_INCLUDE` / `CODEMAP_FE_EXCLUDE` (default excludes the generated `.react-router` route types).
+Markdown goes to `var/nrg-fe-out/` (`OVERVIEW.md` + `modules/<dir.with.dots>.md`).
+
+How it works:
+
+- `ts/src/indexer.mjs` is a long-running Node child process that the PHP indexer talks to over JSON lines. It uses
+  the TypeScript compiler API (pinned `typescript` 6.0.3) with one LanguageService per nearest `tsconfig.json`, so
+  per-app `paths` aliases (`~/*`, `@shared/*`), `baseUrl` and workspace packages resolve like they do in the editor.
+  Only changed files are re-parsed; the services stay warm between polls.
+- Always excluded on top of the PHP defaults: `dist, build, .next, coverage, .nx, .turbo, .cache, .pnpm-store, .yarn`.
+- Names: the namespace is the file's directory (`apps\customer\app\Checkout`), top-level symbols are
+  `<dir>\<file>\<Name>` with the file part dropped for `index.ts` and when it equals the name
+  (`packages\shared\components\Button`), members are `Name::member`. Short names work in every tool.
+- Kinds: `component` (functions/arrow functions/`memo`/`forwardRef` returning JSX with a capitalised name),
+  `function` (hooks carry the `hook` flag), `class`, `interface`, `type`, `enum` (members are `case`), `const`;
+  members are `method` and `property` (constructor parameter properties included, like PHP promoted properties).
+- Refs: `import`, `export` (re-exports), `jsx` (`<Button>`), `func` (calls of functions/hooks), `call` (method calls,
+  resolved through the type checker; unresolved ones are kept as "receivers of unknown type"), `new`, `type`
+  (type positions), `prop`, `const` (enum members), `ref` (other value references). Relations are `extends` /
+  `implements`; decorators are stored as attributes, so `find_by_attribute injectable` works.
+
+Memory: the frontend of nrg-core (~7.6k files) indexes in ~35 s and the container settles at about 3 GB, because the
+type checker stays loaded. `CODEMAP_NODE_MEMORY_MB` (default 4096) caps Node's heap.
+
 ## Configuration
 
 Env vars (or the same keys in snake_case in an optional `codemap.yaml` in the project root):
 
 | Variable | Default | |
 |---|---|---|
+| `CODEMAP_LANG` | `php` | `php`, `ts` (TypeScript/TSX) or `auto` |
 | `CODEMAP_INCLUDE` | `.` | Comma-separated dirs relative to the project root |
 | `CODEMAP_EXCLUDE` | – | Added to the defaults: `vendor, node_modules, var, cache, .git, .idea, .claude, .code-map`. Bare names match any directory; values with `/` or `*` are path globs |
 | `CODEMAP_POLL_INTERVAL` | `5` | Seconds between change checks |
@@ -130,7 +168,9 @@ docker exec -i code-map-myproject codemap serve --stdio                         
 ## Development
 
 ```bash
-composer install
+docker build --target test -t php-code-map:test . && docker run --rm php-code-map:test   # PHP + TypeScript suites
+# or locally (TypeScript tests are skipped without node and `npm ci --prefix ts`):
+composer install && npm ci --prefix ts
 vendor/bin/phpunit
 CODEMAP_PROJECT=$PWD/tests/fixtures/sample-project CODEMAP_DB=var/dev.sqlite CODEMAP_OUT=var/out bin/codemap index
 ```
@@ -139,6 +179,8 @@ Code layout:
 
 - `src/Indexer/SymbolCollector.php`: the AST visitor, where all extraction happens
 - `src/Indexer/Indexer.php`: change detection, parsing and storage
+- `src/Indexer/SourceParser.php`: parser interface; `PhpSourceParser` (in-process) and `TsSourceParser` (Node child process)
+- `ts/src/indexer.mjs`: the TypeScript extractor
 - `src/Storage/schema.sql`: tables (`files`, `symbols`, `relations`, `refs`, `attributes`, `symbols_fts`)
 - `src/Query/CodeQuery.php`: every query; MCP tools and the `query` command both call it
 - `src/Mcp/`: tool registration (schemas come from the method signatures and `@param` docs)
