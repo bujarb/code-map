@@ -51,3 +51,10 @@ export class SeasonalDiscount extends Discount {
 export function formatOrderId(id: OrderId): string {
     return `#${id}`;
 }
+
+/** Generated-enum style: a const object and a type with the same name. */
+export const OrderScope = {
+    Private: 'private',
+    Business: 'business',
+} as const;
+export type OrderScope = (typeof OrderScope)[keyof typeof OrderScope];

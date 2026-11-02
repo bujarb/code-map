@@ -1,4 +1,4 @@
-import { memo } from './memo';
+import { forwardRef, memo } from './memo';
 
 /** Props of the shared button. */
 export interface ButtonProps {
@@ -21,3 +21,7 @@ export function Button({ label, variant = 'primary', onClick }: ButtonProps) {
 }
 
 export const IconButton = memo((props: ButtonProps) => <Button {...props} variant="secondary" />);
+
+export const LinkButton = forwardRef(function LinkButtonInner(props: ButtonProps, ref: unknown) {
+    return <Button {...props} />;
+});

@@ -56,7 +56,7 @@ final class TypeScriptTest extends IndexTestCase
     public function testExcludesNodeModulesAndBuildOutput(): void
     {
         self::assertSame(0, (int) $this->db->scalar("SELECT count(*) FROM files WHERE path LIKE 'node_modules/%' OR path LIKE 'dist/%'"));
-        self::assertSame(10, (int) $this->db->scalar('SELECT count(*) FROM files'));
+        self::assertSame(16, (int) $this->db->scalar('SELECT count(*) FROM files'));
         self::assertSame('ts', $this->db->getMeta('lang'));
     }
 
@@ -88,7 +88,7 @@ final class TypeScriptTest extends IndexTestCase
     {
         $result = $this->query->findUsages('Button');
 
-        self::assertStringContainsString('Usages of packages\shared\components\Button (4):', $result);
+        self::assertStringContainsString('Usages of packages\shared\components\Button (12):', $result);
         self::assertStringContainsString('apps/web/pages/CheckoutPage.tsx:1  (file scope)  [import]', $result, 'tsconfig paths alias @shared/* is resolved');
         self::assertStringContainsString('apps/web/pages/CheckoutPage.tsx:9  apps\web\pages\CheckoutPage  [jsx]', $result);
         self::assertStringContainsString('packages/shared/components/index.ts:1  (file scope)  [export]', $result);
@@ -149,7 +149,7 @@ final class TypeScriptTest extends IndexTestCase
     public function testSearchAndNamespaceTree(): void
     {
         self::assertStringContainsString('function apps\web\hooks\useCart  apps/web/hooks/useCart.ts:1', $this->query->searchSymbols('useCart'));
-        self::assertStringContainsString('packages\shared\components (4)', $this->query->namespaceTree());
+        self::assertStringContainsString('packages\shared\components (10)', $this->query->namespaceTree());
     }
 
     public function testParseErrorsAreRecordedAndPartialResultsKept(): void
@@ -244,5 +244,128 @@ final class TypeScriptTest extends IndexTestCase
     {
         self::assertSame('ts', Config::detectLanguage($this->root));
         self::assertSame('php', Config::detectLanguage(__DIR__.'/fixtures/sample-project'));
+    }
+
+    public function testShortNamePrefersExactCase(): void
+    {
+        // Button (component) vs Button.css\button (style const): exact case wins, the other casing still resolves.
+        self::assertStringStartsWith('Usages of packages\shared\components\Button (12):', $this->query->findUsages('Button'));
+        self::assertStringStartsWith('No usages of packages\shared\components\Button.css\button found.', $this->query->findUsages('button'));
+        self::assertStringContainsString('export function Button(', $this->query->classOutline('Button'));
+        self::assertStringContainsString("export const button: \"shared-button\"", $this->query->classOutline('button'));
+        // No exact-case match: falls back to case-insensitive, and two different symbols are ambiguous.
+        $ambiguous = $this->query->findUsages('BUTTON');
+        self::assertStringContainsString('ambiguous', $ambiguous);
+        self::assertStringContainsString('packages\shared\components\Button.css\button', $ambiguous);
+    }
+
+    public function testConstAndTypeWithTheSameNameAreOneTarget(): void
+    {
+        $usages = $this->query->findUsages('OrderScope');
+        self::assertStringNotContainsString('ambiguous', $usages);
+        self::assertStringStartsWith('Usages of packages\shared\domain\Order\OrderScope (3):', $usages);
+        self::assertStringContainsString('apps/web/services/scope.ts:3  apps\web\services\scope\isBusiness  [type]', $usages);
+        self::assertStringContainsString('apps/web/services/scope.ts:4  apps\web\services\scope\isBusiness  [ref]', $usages);
+
+        $outline = $this->query->classOutline('OrderScope');
+        self::assertStringContainsString('export type OrderScope', $outline);
+        self::assertStringContainsString('also declared as const: export const OrderScope', $outline);
+    }
+
+    public function testSearchRanksExactThenPrefixThenSubstringWithGeneratedLast(): void
+    {
+        $lines = explode("\n", $this->query->searchSymbols('Button', null, 20));
+        self::assertStringStartsWith('component packages\shared\components\Button  ', $lines[0]);
+        self::assertStringStartsWith('const packages\shared\components\Button.css\button  ', $lines[1]);
+        self::assertStringStartsWith('interface packages\shared\components\Button\ButtonProps  ', $lines[2]);
+        $position = static fn (string $needle): int => (int) array_key_first(array_filter($lines, static fn (string $l): bool => str_contains($l, $needle)));
+        self::assertLessThan($position('generated\api\ButtonDto'), $position('Button\ButtonProps'), 'generated prefix hits after production ones');
+        self::assertGreaterThan($position('generated\api\ButtonDto'), $position('Button\IconButton'), 'prefix tier before substring tier');
+        self::assertStringEndsWith('(generated)', $lines[$position('generated\api\ButtonDto')]);
+        self::assertStringEndsWith('(story)', $lines[$position('Button.stories\Primary')]);
+
+        $filtered = $this->query->searchSymbols('Button', null, 20, 'generated,stories');
+        self::assertStringNotContainsString('generated', $filtered);
+        self::assertStringNotContainsString('Button.stories', $filtered);
+    }
+
+    public function testFindUsagesPagingReportsTotal(): void
+    {
+        $first = $this->query->findUsages('Button', null, 5);
+        self::assertStringStartsWith('Usages of packages\shared\components\Button (1-5 of 12; next page: offset=5):', $first);
+        self::assertCount(6, explode("\n", $first));
+
+        $last = $this->query->findUsages('Button', null, 5, 10);
+        self::assertStringStartsWith('Usages of packages\shared\components\Button (11-12 of 12):', $last);
+        self::assertCount(3, explode("\n", $last));
+
+        self::assertStringContainsString('offset 50', $this->query->findUsages('Button', null, 5, 50));
+    }
+
+    public function testFileKindsOrderingAndExclude(): void
+    {
+        self::assertStringContainsString('file kinds: 13 src, 1 test, 1 story, 1 generated', $this->query->indexStatus());
+
+        $all = explode("\n", $this->query->findUsages('Button'));
+        self::assertStringEndsWith('[jsx] (story)', end($all), 'production code first, stories last');
+        self::assertStringContainsString('apps/web/pages/CheckoutPage.test.tsx:6  apps\web\pages\CheckoutPage.test\renderCheckout  [jsx] (test)', implode("\n", $all));
+
+        $production = $this->query->findUsages('Button', null, 100, 0, 'tests,stories');
+        self::assertStringStartsWith('Usages of packages\shared\components\Button (7, plus 5 in excluded tests/stories):', $production);
+        self::assertStringNotContainsString('.test.tsx', $production);
+        self::assertStringNotContainsString('.stories.tsx', $production);
+
+        self::assertStringContainsString('Unknown exclude value "bogus"', $this->query->findUsages('Button', null, 100, 0, 'bogus'));
+    }
+
+    public function testNamespaceTreeAcceptsSlashes(): void
+    {
+        $tree = $this->query->namespaceTree('packages/shared');
+        self::assertStringStartsWith('packages/shared (', $tree);
+        self::assertStringContainsString('  packages/shared/components (10)', $tree);
+        self::assertSame(str_replace('/', '\\', $tree), $this->query->namespaceTree('packages\shared'));
+        self::assertStringContainsString('apps/nope', $this->query->namespaceTree('apps/nope'));
+    }
+
+    public function testDefaultExportedObjectCreateElementAndForwardRefNames(): void
+    {
+        $symbols = array_column($this->db->all('SELECT fqn, kind FROM symbols'), 'kind', 'fqn');
+        self::assertSame('const', $symbols['packages\shared\components\Button.stories\meta'] ?? null, 'export default meta is indexed');
+        self::assertSame('component', $symbols['apps\web\pages\Fallback'] ?? null, 'createElement(Component) in a .ts file');
+        self::assertStringContainsString('forwardRef(function LinkButtonInner(', $this->query->classOutline('packages/shared/components/Button.tsx'));
+        self::assertStringContainsString('apps/web/pages/Fallback.ts:5  apps\web\pages\Fallback  [ref]', $this->query->findUsages('Button'));
+    }
+
+    public function testMemberAccessIsNotAClassUsage(): void
+    {
+        // order.addLine(10) / this.status = OrderStatus.Cancelled are member usages, not usages of the class itself.
+        $usages = $this->query->findUsages('Order');
+        self::assertStringNotContainsString('[call]', $usages);
+        self::assertStringNotContainsString('[prop]', $usages);
+        self::assertStringContainsString('[call]', $this->query->findUsages('Order', 'addLine'));
+    }
+
+    public function testCliPagingAndExcludeOptions(): void
+    {
+        $env = 'CODEMAP_PROJECT='.escapeshellarg($this->root).' CODEMAP_DB='.escapeshellarg($this->config->databasePath).' CODEMAP_OUT= CODEMAP_LANG=ts';
+        $bin = escapeshellarg(\dirname(__DIR__).'/bin/codemap');
+        exec("{$env} {$bin} query find_usages Button --limit=2 --offset=1 --exclude=tests,stories 2>&1", $out, $code);
+        self::assertSame(0, $code, implode("\n", $out));
+        self::assertSame('Usages of packages\shared\components\Button (2-3 of 7, plus 5 in excluded tests/stories; next page: offset=3):', $out[0]);
+        self::assertCount(3, $out);
+
+        exec("{$env} {$bin} query namespace_tree --depth=1 2>&1", $tree, $code);
+        self::assertSame(0, $code, implode("\n", $tree));
+    }
+
+    public function testNewExtractorVersionReparsesUnchangedFiles(): void
+    {
+        self::assertStringStartsWith('ts:', (string) $this->db->getMeta('parser_version'));
+        self::assertSame([], $this->indexer->sync()->indexed, 'nothing changed, nothing re-parsed');
+
+        $this->db->setMeta('parser_version', 'ts:old');
+        self::assertCount(16, $this->indexer->sync()->indexed);
+        self::assertStringStartsWith('ts:', (string) $this->db->getMeta('parser_version'));
+        self::assertNotSame('ts:old', $this->db->getMeta('parser_version'));
     }
 }
