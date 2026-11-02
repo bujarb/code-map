@@ -23,4 +23,10 @@ interface SourceParser
      * @return array<string, array{0: FileSymbols, 1: ?string}> relative path => [symbols, first parse error]
      */
     public function parseFiles(array $sources): array;
+
+    /**
+     * Identifies the extractor's output format. When it differs from the one stored with the index, every file is
+     * re-parsed on the next sync even if its content did not change. An empty string opts out.
+     */
+    public function version(): string;
 }

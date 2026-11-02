@@ -24,6 +24,11 @@ final readonly class PhpSourceParser implements SourceParser
     {
     }
 
+    public function version(): string
+    {
+        return '';
+    }
+
     public function parseFiles(array $sources): array
     {
         $results = [];

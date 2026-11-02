@@ -40,10 +40,14 @@ final class Indexer
             $known[$row['path']] = $row;
         }
 
+        // A new extractor version re-parses everything once, so fixes reach files that did not change.
+        $parserVersion = $this->parser->version();
+        $reparse = '' !== $parserVersion && [] !== $known && $this->db->getMeta('parser_version') !== $parserVersion;
+
         $candidates = [];
         foreach ($onDisk as $path => $stat) {
             $row = $known[$path] ?? null;
-            if ($full || null === $row || (int) $row['mtime'] !== $stat['mtime'] || (int) $row['size'] !== $stat['size']) {
+            if ($full || $reparse || null === $row || (int) $row['mtime'] !== $stat['mtime'] || (int) $row['size'] !== $stat['size']) {
                 $candidates[$path] = $stat;
             }
         }
@@ -67,7 +71,7 @@ final class Indexer
                 }
                 $hash = sha1($code);
                 $existing = $known[$path] ?? null;
-                if (null !== $existing && $existing['hash'] === $hash) {
+                if (null !== $existing && $existing['hash'] === $hash && !$reparse) {
                     $unchanged[$path] = [$stat, $existing];
                 } else {
                     $changed[$path] = [$code, $hash, $stat, $existing];
@@ -107,6 +111,9 @@ final class Indexer
 
         $result->duration = microtime(true) - $started;
         $this->db->setMeta('last_scan', (string) time());
+        if ('' !== $parserVersion) {
+            $this->db->setMeta('parser_version', $parserVersion);
+        }
         if ($full) {
             $this->db->setMeta('last_full_scan', (string) time());
         }

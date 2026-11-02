@@ -44,6 +44,14 @@ final class TsSourceParser implements SourceParser
         }
     }
 
+    public function version(): string
+    {
+        $script = $this->scriptPath();
+        $hash = is_file($script) ? sha1_file($script) : false;
+
+        return false === $hash ? '' : 'ts:'.$hash;
+    }
+
     public function parseFiles(array $sources): array
     {
         if ([] === $sources) {
@@ -114,10 +122,15 @@ final class TsSourceParser implements SourceParser
         return \is_resource($this->process) && (proc_get_status($this->process)['running'] ?? false);
     }
 
+    private function scriptPath(): string
+    {
+        return $this->script ?? \dirname(__DIR__, 2).'/ts/src/indexer.mjs';
+    }
+
     private function start(): void
     {
         $this->stop();
-        $script = $this->script ?? \dirname(__DIR__, 2).'/ts/src/indexer.mjs';
+        $script = $this->scriptPath();
         if (!is_file($script)) {
             throw new \RuntimeException("TypeScript indexer not found at {$script}");
         }

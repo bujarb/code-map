@@ -217,11 +217,19 @@ const COMPONENT_WRAPPER = /(^|\.)(memo|forwardRef|lazy|observer|withRouter|style
 const COMPONENT_TYPE = /\b(FC|FunctionComponent|VFC|ComponentType|ForwardRefExoticComponent|MemoExoticComponent|NamedExoticComponent|LazyExoticComponent)\b/;
 const JSX_RETURN = /\b(JSX\.Element|ReactNode|ReactElement|ReactPortal)\b/;
 
+/** JSX, or `createElement(Component, ...)` / `React.createElement(...)` (not `document.createElement('div')`). */
 function containsJsx(node) {
     let found = false;
     const visit = (n) => {
         if (found) return;
         if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+            found = true;
+            return;
+        }
+        if (ts.isCallExpression(n) && n.arguments.length > 0 && !ts.isStringLiteralLike(n.arguments[0])
+            && (ts.isIdentifier(n.expression) ? n.expression.text === 'createElement'
+                : ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'createElement'
+                    && ts.isIdentifier(n.expression.expression) && n.expression.expression.text === 'React')) {
             found = true;
             return;
         }
@@ -248,11 +256,34 @@ function unwrapFunction(expr) {
     return { fn: null, wrapper };
 }
 
-/** A top-level variable we index: exported, or holding a function / component. */
+const defaultExportCache = new WeakMap();
+
+/** Name of the local identifier a file default-exports (`export default meta` / `export { meta as default }`). */
+function defaultExportedName(sf) {
+    if (defaultExportCache.has(sf)) return defaultExportCache.get(sf);
+    let name = null;
+    for (const st of sf.statements) {
+        if (ts.isExportAssignment(st) && !st.isExportEquals) {
+            let e = st.expression;
+            while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression?.(e)) e = e.expression;
+            if (ts.isIdentifier(e)) name = e.text;
+        } else if (ts.isExportDeclaration(st) && !st.moduleSpecifier && st.exportClause && ts.isNamedExports(st.exportClause)) {
+            for (const el of st.exportClause.elements) {
+                if (el.name.text === 'default') name = (el.propertyName ?? el.name).text;
+            }
+        }
+    }
+    defaultExportCache.set(sf, name);
+    return name;
+}
+
+const isDefaultExportedVariable = (decl) => ts.isIdentifier(decl.name) && defaultExportedName(decl.getSourceFile()) === decl.name.text;
+
+/** A top-level variable we index: exported (also via `export default name`), or holding a function / component. */
 function isIndexedVariable(decl) {
     if (!ts.isIdentifier(decl.name) || !decl.parent?.parent || !ts.isVariableStatement(decl.parent.parent)) return false;
     if (!ts.isSourceFile(decl.parent.parent.parent)) return false;
-    if (isExported(decl.parent.parent)) return true;
+    if (isExported(decl.parent.parent) || isDefaultExportedVariable(decl)) return true;
     if (!decl.initializer) return false;
     const { fn, wrapper } = unwrapFunction(decl.initializer);
     return fn !== null || (wrapper !== null && COMPONENT_WRAPPER.test(wrapper));
@@ -433,7 +464,7 @@ class Extractor {
     looksLikeComponent(name, fn) {
         if (!/^[A-Z]/.test(name)) return false;
         if (fn.type && JSX_RETURN.test(this.text(fn.type))) return true;
-        return this.isTsx && fn.body !== undefined && containsJsx(fn.body);
+        return fn.body !== undefined && containsJsx(fn.body);
     }
 
     variable(statement, decl) {
@@ -441,7 +472,10 @@ class Extractor {
         const kindWord = (statement.declarationList.flags & ts.NodeFlags.Const) ? 'const' : (statement.declarationList.flags & ts.NodeFlags.Let) ? 'let' : 'var';
         const annotation = decl.type ? this.text(decl.type) : '';
         const { fn, wrapper } = decl.initializer ? unwrapFunction(decl.initializer) : { fn: null, wrapper: null };
-        const prefix = `${this.exportPrefix(statement)}${kindWord} ${name}${annotation ? `: ${annotation}` : ''}`;
+        const defaultExported = !isExported(statement) && isDefaultExportedVariable(decl);
+        const exportPrefix = this.exportPrefix(statement);
+        const exportFlags = defaultExported ? ['export', 'default'] : this.exportFlags(statement);
+        const prefix = `${exportPrefix}${kindWord} ${name}${annotation ? `: ${annotation}` : ''}`;
 
         let kind = 'const';
         let signature;
@@ -452,7 +486,7 @@ class Extractor {
             const async = hasModifier(fn, ts.SyntaxKind.AsyncKeyword) ? 'async ' : '';
             const inner = ts.isArrowFunction(fn)
                 ? `${async}${this.typeParams(fn)}${this.params(fn)}${this.returnType(fn)} => …`
-                : `${async}function${this.typeParams(fn)}${this.params(fn)}${this.returnType(fn)} { … }`;
+                : `${async}function${fn.name ? ` ${fn.name.text}` : ''}${this.typeParams(fn)}${this.params(fn)}${this.returnType(fn)} { … }`;
             signature = `${prefix} = ${wrapper ? `${wrapper}(${inner})` : inner}`;
         } else if (/^[A-Z]/.test(name) && ((wrapper !== null && COMPONENT_WRAPPER.test(wrapper)) || COMPONENT_TYPE.test(annotation))) {
             kind = 'component';
@@ -466,16 +500,19 @@ class Extractor {
                     type = '';
                 }
             }
-            signature = `${this.exportPrefix(statement)}${kindWord} ${name}${type ? `: ${oneLine(type, 160)}` : ''}`;
+            signature = `${exportPrefix}${kindWord} ${name}${type ? `: ${oneLine(type, 160)}` : ''}`;
         }
 
+        if (defaultExported) {
+            signature += '  // export default';
+        }
         const id = this.addSymbol({
             kind,
             fqn: topFqn(this.rel, name),
             name,
             node: decl,
             signature,
-            flags: [...this.exportFlags(statement), kind === 'function' && /^use[A-Z0-9]/.test(name) ? 'hook' : null],
+            flags: [...exportFlags, kind === 'function' && /^use[A-Z0-9]/.test(name) ? 'hook' : null],
             doc: this.doc(decl),
         });
         this.collectRefs(decl, id);
