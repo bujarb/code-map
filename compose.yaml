@@ -1,0 +1,27 @@
+# Runs code-map for one PHP project. Defaults are for nrg-core; override per project with env vars:
+#
+#   docker compose up -d --build                     # nrg-core on port 8765
+#   CODEMAP_NAME=shop CODEMAP_PROJECT_PATH=~/code/shop CODEMAP_INCLUDE=src CODEMAP_PORT=8766 docker compose up -d
+#
+# Each CODEMAP_NAME gets its own compose project, container, index volume and output folder.
+name: codemap-${CODEMAP_NAME:-nrg}
+
+services:
+  code-map:
+    build: .
+    image: php-code-map:latest
+    container_name: code-map-${CODEMAP_NAME:-nrg}
+    restart: unless-stopped
+    volumes:
+      - ${CODEMAP_PROJECT_PATH:-../nrg-core/api}:/project:ro
+      - ./var/${CODEMAP_NAME:-nrg}-out:/out
+      - data:/data
+    environment:
+      CODEMAP_PROJECT_NAME: ${CODEMAP_NAME:-nrg}
+      CODEMAP_INCLUDE: ${CODEMAP_INCLUDE:-src,tests}
+    ports:
+      - "127.0.0.1:${CODEMAP_PORT:-8765}:8765"
+
+volumes:
+  data:
+    name: codemap-${CODEMAP_NAME:-nrg}-data

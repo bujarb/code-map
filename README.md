@@ -39,7 +39,17 @@ On nrg-core's `api/` (8.4k files) a full index takes ~21s in the container. Incr
 
 ## Use it in a project
 
-Build the image once:
+The quickest way is the [compose.yaml](compose.yaml) in this repo. It builds the image and starts the container,
+and restarts it with Docker:
+
+```bash
+docker compose up -d --build
+```
+
+Its defaults point at `../nrg-core/api` on port 8765. For another project, set `CODEMAP_NAME`, `CODEMAP_PROJECT_PATH`,
+`CODEMAP_INCLUDE` and `CODEMAP_PORT`; each name gets its own container, index volume and `var/<name>-out` folder.
+
+To run it from the project's own compose file instead, build the image once:
 
 ```bash
 docker build -t php-code-map:latest ~/Docker/php-code-map
