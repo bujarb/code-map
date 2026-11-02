@@ -24,13 +24,23 @@ abstract class IndexTestCase extends TestCase
     protected function setUp(): void
     {
         $this->root = sys_get_temp_dir().'/codemap-test-'.bin2hex(random_bytes(4));
-        $this->copy(__DIR__.'/fixtures/sample-project', $this->root);
+        $this->copy(__DIR__.'/fixtures/'.$this->fixture(), $this->root);
 
-        $this->config = new Config(projectRoot: $this->root, databasePath: $this->root.'/.data/index.sqlite', outputDir: $this->root.'/.code-map');
+        $this->config = new Config(projectRoot: $this->root, databasePath: $this->root.'/.data/index.sqlite', outputDir: $this->root.'/.code-map', exclude: Config::defaultExcludes($this->lang()), lang: $this->lang());
         $this->db = new Database($this->config->databasePath);
         $this->indexer = new Indexer($this->config, $this->db);
         $this->query = new CodeQuery($this->db);
         $this->indexer->sync();
+    }
+
+    protected function fixture(): string
+    {
+        return 'sample-project';
+    }
+
+    protected function lang(): string
+    {
+        return 'php';
     }
 
     protected function tearDown(): void
