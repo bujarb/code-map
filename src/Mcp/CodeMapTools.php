@@ -29,6 +29,19 @@ final readonly class CodeMapTools
         'index_status' => ['indexStatus', 'Index freshness: file and symbol counts, last scan time, files that failed to parse.'],
     ];
 
+    /**
+     * Descriptions that differ when the index holds a TypeScript project (same tools, same parameters).
+     */
+    public const array TS_DESCRIPTIONS = [
+        'find_usages' => 'Who imports / renders / calls / references an exported symbol (component, function, class, interface, type, enum, const) or one of its members, with file:line. JSX usages (<Button>), imports, calls, new, type references and re-exports are all included. With a member it also shows the member\'s signature, what it calls, overrides in subtypes, and calls of the same method name on values of unknown type. Short names work (e.g. "Button", "useCart", "OrderService::create").',
+        'class_outline' => 'Outline of a class, interface, type, enum, component or function: extends/implements, decorators, properties (incl. constructor parameter properties), methods with line numbers. Pass a .ts/.tsx path to outline a whole file. Short names work. Much cheaper than reading the file.',
+        'find_implementations' => 'All subtypes of a class or interface: implementing classes, subclasses and extending interfaces, transitively, with file:line. Short names work.',
+        'callees' => 'What a function, component or method references: calls, rendered JSX components, instantiations, type references. Pass "Name" or "Class::method".',
+        'find_by_attribute' => 'Symbols carrying a TypeScript decorator (e.g. injectable, Component, Input), optionally filtered by text in the decorator arguments.',
+        'search_symbols' => 'Find components, functions, classes, interfaces, types, enums, consts and members by partial name or doc words (camelCase-aware: "useCart", "order status"). Only needed when you do not know a name; the other tools accept short names directly.',
+        'namespace_tree' => 'Directory (module) hierarchy with top-level symbol counts, for orientation in an unfamiliar area. Directories are separated by "\\".',
+    ];
+
     public function __construct(private CodeQuery $query)
     {
     }
