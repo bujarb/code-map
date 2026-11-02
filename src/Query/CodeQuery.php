@@ -22,29 +22,69 @@ final readonly class CodeQuery
     {
     }
 
-    public function searchSymbols(string $query, ?string $kind = null, int $limit = 10): string
+    /**
+     * Ranking: exact name (exact case first), then name prefix, then name substring, then full-text hits on
+     * camelCase words and docs. Within each tier production code comes before tests, stories and generated code.
+     */
+    public function searchSymbols(string $query, ?string $kind = null, int $limit = 10, ?string $exclude = null): string
     {
         $limit = max(1, min($limit, 200));
+        try {
+            $excluded = FileKind::parseExclude($exclude);
+        } catch (\InvalidArgumentException $e) {
+            return $e->getMessage();
+        }
         $kindSql = null === $kind || '' === $kind ? '' : ' AND s.kind = :kind';
         $params = null === $kind || '' === $kind ? [] : ['kind' => $kind];
+        $fileKind = FileKind::sql('f.path');
+        $rank = FileKind::rankSql('f.path');
+        if ([] !== $excluded) {
+            $kindSql .= " AND ({$fileKind}) NOT IN ('".implode("','", $excluded)."')";
+        }
+        $select = "SELECT s.id, s.kind, s.fqn, s.doc, s.start_line, f.path, ({$fileKind}) AS file_kind";
+        $order = "{$rank}, (s.parent_id IS NULL) DESC, (s.kind IN {$this->kindList()}) DESC, length(s.fqn)";
 
         $rows = [];
-        // All terms first; if that's thin, top up with symbols matching any term.
+        $add = static function (array $found) use (&$rows): void {
+            foreach ($found as $row) {
+                $rows[$row['id']] ??= $row;
+            }
+        };
+
+        $name = trim($query);
+        if (1 === preg_match('/^[\p{L}_$][\p{L}\p{N}_$]*$/u', $name)) {
+            $like = $this->escapeLike($name);
+            $tiers = [
+                ['s.name = :name COLLATE NOCASE', "(s.name = :name) DESC, {$order}", ['name' => $name]],
+                ["s.name LIKE :like ESCAPE '!'", "(s.name GLOB :glob) DESC, {$order}", ['like' => $like.'%', 'glob' => strtr($name, ['[' => '[[]', '*' => '[*]', '?' => '[?]']).'*']],
+                ["s.name LIKE :like ESCAPE '!'", $order, ['like' => '%'.$like.'%']],
+            ];
+            foreach ($tiers as [$where, $tierOrder, $tierParams]) {
+                if (\count($rows) >= $limit) {
+                    break;
+                }
+                $add($this->db->all(
+                    "{$select} FROM symbols s JOIN files f ON f.id = s.file_id
+                     WHERE {$where}{$kindSql} ORDER BY {$tierOrder} LIMIT {$limit}",
+                    [...$tierParams, ...$params],
+                ));
+            }
+        }
+
+        // Fuzzy: all terms first; if that's thin, top up with symbols matching any term. Generated code last.
         foreach ([' ', ' OR '] as $operator) {
             $match = $this->ftsQuery($query, $operator);
             if ('' === $match || \count($rows) >= $limit) {
                 break;
             }
-            foreach ($this->db->all(
-                "SELECT s.id, s.kind, s.fqn, s.doc, s.start_line, f.path
+            $add($this->db->all(
+                "{$select}
                  FROM symbols_fts JOIN symbols s ON s.id = symbols_fts.rowid JOIN files f ON f.id = s.file_id
                  WHERE symbols_fts MATCH :match{$kindSql}
-                 ORDER BY (s.kind IN {$this->kindList()}) DESC, bm25(symbols_fts, 1.0, 10.0, 2.0)
+                 ORDER BY (({$fileKind}) = 'generated'), (s.kind IN {$this->kindList()}) DESC, bm25(symbols_fts, 1.0, 10.0, 2.0)
                  LIMIT {$limit}",
                 ['match' => $match, ...$params],
-            ) as $row) {
-                $rows[$row['id']] ??= $row;
-            }
+            ));
             if (!str_contains($match, ' ')) {
                 break; // single term: OR would return the same rows
             }
@@ -52,20 +92,21 @@ final readonly class CodeQuery
         $rows = \array_slice(array_values($rows), 0, $limit);
         if ([] === $rows) {
             $rows = $this->db->all(
-                "SELECT s.kind, s.fqn, s.doc, s.start_line, f.path
+                "{$select}
                  FROM symbols s JOIN files f ON f.id = s.file_id
                  WHERE s.fqn LIKE :like ESCAPE '!'{$kindSql}
-                 ORDER BY length(s.fqn) LIMIT {$limit}",
+                 ORDER BY {$rank}, length(s.fqn) LIMIT {$limit}",
                 ['like' => '%'.$this->escapeLike($query).'%', ...$params],
             );
         }
         if ([] === $rows) {
-            return "No symbols match \"{$query}\".";
+            return "No symbols match \"{$query}\".".([] === $excluded ? '' : ' (excluding '.FileKind::describe($excluded).')');
         }
 
         // Docs are cut short here: the result is for picking a symbol, class_outline shows the details.
         return implode("\n", array_map(
             static fn (array $r) => "{$r['kind']} {$r['fqn']}  {$r['path']}:{$r['start_line']}"
+                .(FileKind::SRC === $r['file_kind'] ? '' : " ({$r['file_kind']})")
                 .(null === $r['doc'] ? '' : ' — '.(mb_strlen($r['doc']) > 80 ? mb_substr($r['doc'], 0, 80).'…' : $r['doc'])),
             $rows,
         ));
@@ -91,6 +132,16 @@ final readonly class CodeQuery
         }
 
         $out = [$class['signature'], "file: {$class['path']}:{$class['start_line']}-{$class['end_line']}"];
+        if ('ts' === $this->lang()) {
+            // e.g. `export const Scope = {...} as const; export type Scope = ...`: one name, two declarations.
+            foreach ($this->db->all(
+                'SELECT s.kind, s.signature, s.start_line, f.path FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE s.fqn = ? AND s.id <> ? AND s.parent_id IS NULL',
+                [$class['fqn'], $class['id']],
+            ) as $twin) {
+                $out[] = "also declared as {$twin['kind']}: ".Names::shortenAll($twin['signature'])."  ({$twin['path']}:{$twin['start_line']})";
+            }
+        }
         if (null !== $class['doc']) {
             $out[] = 'doc: '.$class['doc'];
         }
@@ -211,24 +262,36 @@ final readonly class CodeQuery
      * For a member, calls made through a parent class or interface (or on a subclass) are included, since they
      * can dispatch to this method, and calls on receivers of unknown type are listed separately. That way one
      * call answers "who calls X" without follow-up queries.
+     *
+     * Results are ordered production code first (then tests, stories, generated code), and paged with
+     * $limit / $offset; the header always carries the total.
      */
-    public function findUsages(string $fqcn, ?string $member = null, int $limit = 100): string
+    public function findUsages(string $fqcn, ?string $member = null, int $limit = 100, int $offset = 0, ?string $exclude = null): string
     {
         if (null !== ($ambiguous = $this->ambiguity($fqcn))) {
             return $ambiguous;
         }
+        try {
+            $excluded = FileKind::parseExclude($exclude);
+        } catch (\InvalidArgumentException $e) {
+            return $e->getMessage();
+        }
         $limit = max(1, min($limit, 500));
+        $offset = max(0, $offset);
         $target = $this->canonicalName($fqcn);
         $member = null === $member || '' === $member ? null : ltrim($member, ':');
+        $ts = 'ts' === $this->lang();
 
         if (null === $member) {
             // Without a member, a class's references to itself ($this->foo(), self::BAR) are noise.
+            // In TypeScript, member accesses on instances (order.total(), props.label) are not usages of the type
+            // itself; the reference to the type or value name is recorded separately.
+            $memberKinds = $ts ? " AND r.kind NOT IN ('call', 'prop', 'const')" : '';
             $rows = $this->db->all(
                 "SELECT r.kind, r.target_class, r.target_member, r.line, f.path, s.fqn AS caller
                  FROM refs r JOIN files f ON f.id = r.file_id LEFT JOIN symbols s ON s.id = r.symbol_id
-                 WHERE r.target_class = :target COLLATE NOCASE
-                   AND (s.fqn IS NULL OR (s.fqn <> :target COLLATE NOCASE AND s.fqn NOT LIKE :own ESCAPE '!'))
-                 ORDER BY f.path, r.line LIMIT {$limit}",
+                 WHERE {$this->sameName('r.target_class', 'target')}{$memberKinds}
+                   AND (s.fqn IS NULL OR (s.fqn <> :target COLLATE NOCASE AND s.fqn NOT LIKE :own ESCAPE '!'))",
                 ['target' => $target, 'own' => $this->escapeLike($target).'::%'],
             );
         } else {
@@ -237,20 +300,19 @@ final readonly class CodeQuery
             $rows = $this->db->all(
                 "SELECT r.kind, r.target_class, r.target_member, r.line, f.path, s.fqn AS caller
                  FROM refs r JOIN files f ON f.id = r.file_id LEFT JOIN symbols s ON s.id = r.symbol_id
-                 WHERE r.target_class COLLATE NOCASE IN ({$in}) AND r.target_member = :member
-                 ORDER BY f.path, r.line LIMIT {$limit}",
+                 WHERE r.target_class COLLATE NOCASE IN ({$in}) AND r.target_member = :member",
                 ['member' => $member],
             );
         }
 
-        $out = [];
+        $items = [];
         if (null === $member) {
             foreach ($this->db->all(
-                'SELECT r.kind, s.fqn, s.start_line, f.path FROM relations r JOIN symbols s ON s.id = r.symbol_id JOIN files f ON f.id = s.file_id
-                 WHERE r.target = ? COLLATE NOCASE ORDER BY f.path',
-                [$target],
+                "SELECT r.kind, s.fqn, s.start_line, f.path FROM relations r JOIN symbols s ON s.id = r.symbol_id JOIN files f ON f.id = s.file_id
+                 WHERE {$this->sameName('r.target', 'target')}",
+                ['target' => $target],
             ) as $rel) {
-                $out[] = "{$rel['path']}:{$rel['start_line']}  {$rel['fqn']}  [{$rel['kind']}]";
+                $items[] = [$rel['path'], (int) $rel['start_line'], "{$rel['path']}:{$rel['start_line']}  {$rel['fqn']}  [{$rel['kind']}]"];
             }
         }
         foreach ($rows as $r) {
@@ -258,13 +320,24 @@ final readonly class CodeQuery
             if (0 !== strcasecmp($r['target_class'], $target)) {
                 $what .= ' via '.$this->shortName($r['target_class']);
             }
-            $out[] = "{$r['path']}:{$r['line']}  ".($r['caller'] ?? '(file scope)')."  [{$what}]";
+            $items[] = [$r['path'], (int) $r['line'], "{$r['path']}:{$r['line']}  ".($r['caller'] ?? '(file scope)')."  [{$what}]"];
         }
 
+        [$out, $total, $hidden] = $this->page($items, $excluded, $limit, $offset);
+
         $title = $target.(null === $member ? '' : '::'.$member);
-        $result = [] === $out
-            ? "No usages of {$title} found."
-            : "Usages of {$title} (".\count($out).(\count($rows) === $limit ? '+, truncated' : '')."):\n".implode("\n", $out);
+        $excludedNote = [] === $excluded ? '' : ", plus {$hidden} in excluded ".FileKind::describe($excluded);
+        if (0 === $total) {
+            $result = "No usages of {$title} found".([] === $excluded ? '.' : " outside excluded ".FileKind::describe($excluded)." ({$hidden} there).");
+        } elseif ([] === $out) {
+            $result = "Usages of {$title}: {$total} in total{$excludedNote}; offset {$offset} is past the end.";
+        } elseif (0 === $offset && \count($out) === $total) {
+            $result = "Usages of {$title} ({$total}{$excludedNote}):\n".implode("\n", $out);
+        } else {
+            $last = $offset + \count($out);
+            $next = $last < $total ? "; next page: offset={$last}" : '';
+            $result = "Usages of {$title} (".($offset + 1)."-{$last} of {$total}{$excludedNote}{$next}):\n".implode("\n", $out);
+        }
         if (null !== $member) {
             // The definition and any overrides are what an impact question needs next, so save it the outline call.
             $result = $this->memberDefinitions($target, $member)."\n\n".$result;
@@ -272,13 +345,16 @@ final readonly class CodeQuery
 
         // Calls on receivers whose type couldn't be inferred might still hit this method; list them rather than hide them.
         if (null !== $member) {
-            $unknown = $this->db->all(
-                "SELECT r.line, f.path, s.fqn AS caller FROM refs r JOIN files f ON f.id = r.file_id LEFT JOIN symbols s ON s.id = r.symbol_id
-                 WHERE r.kind = 'call' AND r.target_class IS NULL AND r.target_member = ? ORDER BY f.path, r.line",
-                [$member],
-            );
+            $unknown = array_values(array_filter(
+                $this->db->all(
+                    "SELECT r.line, f.path, s.fqn AS caller FROM refs r JOIN files f ON f.id = r.file_id LEFT JOIN symbols s ON s.id = r.symbol_id
+                     WHERE r.kind = 'call' AND r.target_class IS NULL AND r.target_member = ? ORDER BY f.path, r.line",
+                    [$member],
+                ),
+                static fn (array $u) => !\in_array(FileKind::of($u['path']), $excluded, true),
+            ));
             if ([] !== $unknown) {
-                $arrow = 'ts' === $this->lang() ? '.' : '->';
+                $arrow = $ts ? '.' : '->';
                 $result .= "\n\nCalls to {$arrow}{$member}() on receivers of unknown type (may or may not be this method), ".\count($unknown).':';
                 foreach (\array_slice($unknown, 0, 20) as $u) {
                     $result .= "\n{$u['path']}:{$u['line']}  ".($u['caller'] ?? '(file scope)');
@@ -287,7 +363,7 @@ final readonly class CodeQuery
                     $result .= "\n… and ".(\count($unknown) - 20).' more (a common method name; narrow down with grep if it matters)';
                 }
             } else {
-                $result .= 'ts' === $this->lang()
+                $result .= $ts
                     ? "\nNo unresolved calls to .{$member}(), so this list is complete for the indexed TypeScript code."
                     : "\nNo calls on receivers of unknown type, so this list is complete for PHP code.";
             }
@@ -389,10 +465,12 @@ final readonly class CodeQuery
      */
     public function namespaceTree(string $prefix = '', int $depth = 3): string
     {
-        $prefix = trim($prefix, '\\');
+        // OVERVIEW.md of TypeScript projects prints directories with "/"; answer in the separator that was asked for.
+        $slashes = str_contains($prefix, '/');
+        $prefix = trim(str_replace('/', '\\', $prefix), '\\');
         $counts = $this->namespaceCounts($prefix);
         if ([] === $counts) {
-            return '' === $prefix ? 'The index is empty.' : "No namespace under \"{$prefix}\".";
+            return '' === $prefix ? 'The index is empty.' : 'No namespace under "'.($slashes ? str_replace('\\', '/', $prefix) : $prefix).'".';
         }
 
         $baseDepth = '' === $prefix ? 0 : \count(explode('\\', $prefix));
@@ -411,7 +489,7 @@ final readonly class CodeQuery
         $out = [];
         foreach ($tree as $ns => $count) {
             $level = \count(explode('\\', $ns)) - max($baseDepth, 1);
-            $out[] = str_repeat('  ', $level).$ns." ({$count})";
+            $out[] = str_repeat('  ', $level).($slashes ? str_replace('\\', '/', $ns) : $ns)." ({$count})";
         }
 
         return implode("\n", $out);
@@ -433,6 +511,10 @@ final readonly class CodeQuery
             'last full rescan: '.$time('last_full_scan'),
             "files with parse errors: {$errorCount}",
         ];
+        $kinds = $this->db->all('SELECT ('.FileKind::sql('path').') AS kind, count(*) AS n FROM files GROUP BY kind ORDER BY n DESC');
+        if (\count($kinds) > 1) {
+            array_splice($out, 1, 0, ['file kinds: '.implode(', ', array_map(static fn (array $r) => "{$r['n']} {$r['kind']}", $kinds))]);
+        }
         foreach ($errors as $e) {
             $out[] = "  {$e['path']}: {$e['parse_error']}";
         }
@@ -521,9 +603,44 @@ final readonly class CodeQuery
         $kinds = $this->kindList();
         $sql = "SELECT s.*, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.kind IN {$kinds} AND s.parent_id IS NULL";
 
-        return $this->db->one("{$sql} AND s.fqn = ? COLLATE NOCASE", [$fqcn])
-            // Accept a short name when it's unambiguous, since agents often only know "UserService".
-            ?? $this->uniqueRow($this->db->all("{$sql} AND s.name = ? COLLATE NOCASE LIMIT 2", [$fqcn]));
+        if ('ts' !== $this->lang()) {
+            return $this->db->one("{$sql} AND s.fqn = ? COLLATE NOCASE", [$fqcn])
+                // Accept a short name when it's unambiguous, since agents often only know "UserService".
+                ?? $this->uniqueRow($this->db->all("{$sql} AND s.name = ? COLLATE NOCASE LIMIT 2", [$fqcn]));
+        }
+
+        // TypeScript: an exact-case match wins over case-insensitive ones (TariffTile vs the css const tariffTile),
+        // and declarations sharing one name (const + type, interface merging) count as one symbol.
+        foreach (['s.fqn', 's.name'] as $column) {
+            $exact = $this->db->all("{$sql} AND {$column} = :n COLLATE NOCASE AND {$column} = :n LIMIT 50", ['n' => $fqcn]);
+            if ([] !== $exact) {
+                return $this->oneSymbol($exact);
+            }
+            if (null !== ($row = $this->oneSymbol($this->db->all("{$sql} AND {$column} = :n COLLATE NOCASE LIMIT 50", ['n' => $fqcn])))) {
+                return $row;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The row to use when all rows are declarations of the same name, preferring the most type-like kind; null when
+     * the rows name different symbols.
+     *
+     * @param list<array<string, mixed>> $rows
+     *
+     * @return array<string, mixed>|null
+     */
+    private function oneSymbol(array $rows): ?array
+    {
+        if ([] === $rows || 1 !== \count(array_unique(array_column($rows, 'fqn')))) {
+            return null;
+        }
+        $order = array_flip(self::TS_TYPE_KINDS);
+        usort($rows, static fn (array $a, array $b) => ($order[$a['kind']] ?? 99) <=> ($order[$b['kind']] ?? 99));
+
+        return $rows[0];
     }
 
     private function canonicalName(string $fqcn): string
@@ -542,18 +659,31 @@ final readonly class CodeQuery
             return null;
         }
         $kinds = $this->kindList();
-        $rows = $this->db->all(
-            "SELECT s.kind, s.fqn, s.start_line, f.path FROM symbols s JOIN files f ON f.id = s.file_id
-             WHERE s.kind IN {$kinds} AND s.parent_id IS NULL AND s.name = ? COLLATE NOCASE ORDER BY s.fqn LIMIT 20",
-            [$name],
-        );
-        if (\count($rows) < 2) {
+        $sql = "SELECT s.kind, s.fqn, s.start_line, f.path FROM symbols s JOIN files f ON f.id = s.file_id
+                WHERE s.kind IN {$kinds} AND s.parent_id IS NULL AND s.name = :n COLLATE NOCASE";
+        $rows = [];
+        if ('ts' === $this->lang()) {
+            $rows = $this->db->all("{$sql} AND s.name = :n ORDER BY s.fqn LIMIT 40", ['n' => $name]);
+        }
+        if ([] === $rows) {
+            $rows = $this->db->all("{$sql} ORDER BY s.fqn LIMIT 40", ['n' => $name]);
+        }
+        // One line per name: a const and a type called the same are one target.
+        $byFqn = [];
+        foreach ($rows as $r) {
+            if (isset($byFqn[$r['fqn']])) {
+                $byFqn[$r['fqn']]['kind'] .= '+'.$r['kind'];
+                continue;
+            }
+            $byFqn[$r['fqn']] = $r;
+        }
+        if (\count($byFqn) < 2) {
             return null;
         }
 
         return "\"{$name}\" is ambiguous; repeat with one of these fully-qualified names:\n".implode("\n", array_map(
             static fn (array $r) => "{$r['kind']} {$r['fqn']}  {$r['path']}:{$r['start_line']}",
-            $rows,
+            \array_slice(array_values($byFqn), 0, 20),
         ));
     }
 
@@ -693,6 +823,41 @@ final readonly class CodeQuery
     private function kindList(): string
     {
         return "('".implode("','", $this->typeKinds())."')";
+    }
+
+    /**
+     * Sorts usage lines production code first, then by path and line, drops excluded file kinds and cuts one page.
+     *
+     * @param list<array{0: string, 1: int, 2: string}> $items  [path, line, text]
+     * @param list<string>                              $excluded
+     *
+     * @return array{0: list<string>, 1: int, 2: int} [page lines, total after exclusion, number excluded]
+     */
+    private function page(array $items, array $excluded, int $limit, int $offset): array
+    {
+        $kinds = [];
+        $kept = [];
+        foreach ($items as $item) {
+            $kind = $kinds[$item[0]] ??= FileKind::of($item[0]);
+            if (\in_array($kind, $excluded, true)) {
+                continue;
+            }
+            $kept[] = [FileKind::rank($kind), $item[0], $item[1], FileKind::SRC === $kind ? $item[2] : $item[2]." ({$kind})"];
+        }
+        usort($kept, static fn (array $a, array $b) => [$a[0], $a[1], $a[2]] <=> [$b[0], $b[1], $b[2]]);
+
+        return [array_column(\array_slice($kept, $offset, $limit), 3), \count($kept), \count($items) - \count($kept)];
+    }
+
+    /**
+     * Name comparison for a column against a named parameter. PHP names are case-insensitive; TypeScript names are
+     * not (Button and button can both exist), so TS adds an exact comparison on top of the indexed NOCASE one.
+     */
+    private function sameName(string $column, string $param): string
+    {
+        $nocase = "{$column} = :{$param} COLLATE NOCASE";
+
+        return 'ts' === $this->lang() ? "({$nocase} AND {$column} = :{$param})" : $nocase;
     }
 
     private function shortName(string $fqcn): string
