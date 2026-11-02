@@ -3,3 +3,5 @@
 /.phpunit.cache/
 .code-map/
 bench/results/
+/ts/node_modules/
+.env

@@ -1,6 +1,9 @@
 vendor
 var
-tests
 .git
+.env
+.idea
 .phpunit.cache
 .code-map
+bench
+ts/node_modules
