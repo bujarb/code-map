@@ -6,12 +6,6 @@ namespace CodeMap\Indexer;
 
 use CodeMap\Config\Config;
 use CodeMap\Storage\Database;
-use PhpParser\Error;
-use PhpParser\ErrorHandler\Collecting;
-use PhpParser\NodeTraverser;
-use PhpParser\NodeVisitor\NameResolver;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 
 /**
  * Brings the database in line with the files on disk. Only files whose mtime/size changed are read,
@@ -21,14 +15,15 @@ final class Indexer
 {
     private const int BATCH_SIZE = 250;
 
-    private readonly Parser $parser;
+    private readonly SourceParser $parser;
     private readonly FileFinder $finder;
 
     public function __construct(
         private readonly Config $config,
         private readonly Database $db,
+        ?SourceParser $parser = null,
     ) {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+        $this->parser = $parser ?? ('ts' === $config->lang ? new TsSourceParser($config) : new PhpSourceParser());
         $this->finder = new FileFinder($config);
     }
 
@@ -45,10 +40,14 @@ final class Indexer
             $known[$row['path']] = $row;
         }
 
+        // A new extractor version re-parses everything once, so fixes reach files that did not change.
+        $parserVersion = $this->parser->version();
+        $reparse = '' !== $parserVersion && [] !== $known && $this->db->getMeta('parser_version') !== $parserVersion;
+
         $candidates = [];
         foreach ($onDisk as $path => $stat) {
             $row = $known[$path] ?? null;
-            if ($full || null === $row || (int) $row['mtime'] !== $stat['mtime'] || (int) $row['size'] !== $stat['size']) {
+            if ($full || $reparse || null === $row || (int) $row['mtime'] !== $stat['mtime'] || (int) $row['size'] !== $stat['size']) {
                 $candidates[$path] = $stat;
             }
         }
@@ -57,19 +56,44 @@ final class Indexer
         $result = new SyncResult(scanned: \count($onDisk));
         $pdo = $this->db->pdo;
         $done = 0;
+        $this->db->setMeta('lang', $this->config->lang);
+        $this->parser->beginSync(array_keys($onDisk));
 
         foreach (array_chunk($candidates, self::BATCH_SIZE, true) as $batch) {
+            // Read and hash first; only files whose content changed go to the parser (in one call, so the
+            // TypeScript parser can resolve the whole batch against one program).
+            $unchanged = [];
+            $changed = [];
+            foreach ($batch as $path => $stat) {
+                $code = @file_get_contents($this->config->projectRoot.'/'.$path);
+                if (false === $code) {
+                    continue; // vanished between stat and read; the next poll will remove it
+                }
+                $hash = sha1($code);
+                $existing = $known[$path] ?? null;
+                if (null !== $existing && $existing['hash'] === $hash && !$reparse) {
+                    $unchanged[$path] = [$stat, $existing];
+                } else {
+                    $changed[$path] = [$code, $hash, $stat, $existing];
+                }
+            }
+            $parsed = $this->parser->parseFiles(array_map(static fn (array $c) => $c[0], $changed));
+
             $pdo->beginTransaction();
             try {
-                foreach ($batch as $path => $stat) {
-                    $this->indexFile($path, $stat, $known[$path] ?? null, $result);
-                    ++$done;
+                foreach ($unchanged as [$stat, $existing]) {
+                    $pdo->prepare('UPDATE files SET mtime = ?, size = ? WHERE id = ?')->execute([$stat['mtime'], $stat['size'], $existing['id']]);
+                }
+                foreach ($changed as $path => [, $hash, $stat, $existing]) {
+                    [$symbols, $error] = $parsed[$path] ?? [new FileSymbols(), 'parser returned no result'];
+                    $this->storeFile((string) $path, $hash, $stat, $existing, $symbols, $error, $result);
                 }
                 $pdo->commit();
             } catch (\Throwable $e) {
                 $pdo->rollBack();
                 throw $e;
             }
+            $done += \count($batch);
             if (null !== $progress) {
                 $progress($done, \count($candidates));
             }
@@ -87,6 +111,9 @@ final class Indexer
 
         $result->duration = microtime(true) - $started;
         $this->db->setMeta('last_scan', (string) time());
+        if ('' !== $parserVersion) {
+            $this->db->setMeta('parser_version', $parserVersion);
+        }
         if ($full) {
             $this->db->setMeta('last_full_scan', (string) time());
         }
@@ -98,26 +125,11 @@ final class Indexer
     }
 
     /**
-     * @param array{mtime: int, size: int}  $stat
-     * @param array<string, mixed>|null      $existing
+     * @param array{mtime: int, size: int} $stat
+     * @param array<string, mixed>|null    $existing
      */
-    private function indexFile(string $path, array $stat, ?array $existing, SyncResult $result): void
+    private function storeFile(string $path, string $hash, array $stat, ?array $existing, FileSymbols $symbols, ?string $error, SyncResult $result): void
     {
-        $code = @file_get_contents($this->config->projectRoot.'/'.$path);
-        if (false === $code) {
-            return; // vanished between stat and read; the next poll will remove it
-        }
-        $hash = sha1($code);
-
-        if (null !== $existing && $existing['hash'] === $hash) {
-            $this->db->pdo->prepare('UPDATE files SET mtime = ?, size = ? WHERE id = ?')
-                ->execute([$stat['mtime'], $stat['size'], $existing['id']]);
-
-            return;
-        }
-
-        [$symbols, $error] = $this->parse($code);
-
         if (null !== $existing) {
             $this->db->pdo->prepare('DELETE FROM files WHERE id = ?')->execute([$existing['id']]);
         }
@@ -134,27 +146,13 @@ final class Indexer
     }
 
     /**
+     * Parses one PHP snippet (kept for callers that used the indexer as a parser).
+     *
      * @return array{0: FileSymbols, 1: ?string}
      */
     public function parse(string $code): array
     {
-        // Collect errors instead of throwing so a half-written file still yields whatever parsed cleanly.
-        $errors = new Collecting();
-        try {
-            $ast = $this->parser->parse($code, $errors) ?? [];
-        } catch (Error $e) {
-            return [new FileSymbols(), $e->getMessage()];
-        }
-
-        // Two passes: the collector looks ahead at property/constructor types when entering a class,
-        // so every name in the file must already be resolved by then.
-        $ast = (new NodeTraverser(new NameResolver()))->traverse($ast);
-        $collector = new SymbolCollector();
-        (new NodeTraverser($collector))->traverse($ast);
-
-        $error = $errors->hasErrors() ? $errors->getErrors()[0]->getMessage() : null;
-
-        return [$collector->result, $error];
+        return ($this->parser instanceof PhpSourceParser ? $this->parser : new PhpSourceParser())->parse($code);
     }
 
     public static function splitWords(string $name): string

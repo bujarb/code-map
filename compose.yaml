@@ -1,7 +1,9 @@
-# Runs code-map for one PHP project. Defaults are for nrg-core; override per project with env vars:
+# Runs code-map for one PHP project and (optionally) its TypeScript frontend. Defaults are for nrg-core;
+# override per project with env vars:
 #
-#   docker compose up -d --build                     # nrg-core on port 8765
-#   CODEMAP_NAME=shop CODEMAP_PROJECT_PATH=~/code/shop CODEMAP_INCLUDE=src CODEMAP_PORT=8766 docker compose up -d
+#   docker compose up -d --build code-map            # nrg-core API (PHP) on port 8765
+#   docker compose up -d --build code-map-fe         # nrg-core frontend (TypeScript/React) on port 8766
+#   CODEMAP_NAME=shop CODEMAP_PROJECT_PATH=~/code/shop CODEMAP_INCLUDE=src CODEMAP_PORT=8767 docker compose up -d code-map
 #
 # Each CODEMAP_NAME gets its own compose project, container, index volume and output folder.
 name: codemap-${CODEMAP_NAME:-nrg}
@@ -22,6 +24,28 @@ services:
     ports:
       - "127.0.0.1:${CODEMAP_PORT:-8765}:8765"
 
+  # Same image, TypeScript mode: indexes .ts/.tsx with the TypeScript compiler (tsconfig paths honoured).
+  # node_modules, dist, build, .next, coverage, .nx and package-manager stores are always excluded.
+  code-map-fe:
+    build: .
+    image: php-code-map:latest
+    container_name: code-map-${CODEMAP_NAME:-nrg}-fe
+    restart: unless-stopped
+    volumes:
+      - ${CODEMAP_FE_PROJECT_PATH:-../nrg-core/frontend}:/project:ro
+      - ./var/${CODEMAP_NAME:-nrg}-fe-out:/out
+      - fe-data:/data
+    environment:
+      CODEMAP_LANG: ts
+      CODEMAP_PROJECT_NAME: ${CODEMAP_NAME:-nrg}-fe
+      CODEMAP_INCLUDE: ${CODEMAP_FE_INCLUDE:-.}
+      # generated React Router route types; add more with a comma-separated list
+      CODEMAP_EXCLUDE: ${CODEMAP_FE_EXCLUDE:-.react-router}
+    ports:
+      - "127.0.0.1:${CODEMAP_FE_PORT:-8766}:8765"
+
 volumes:
   data:
     name: codemap-${CODEMAP_NAME:-nrg}-data
+  fe-data:
+    name: codemap-${CODEMAP_NAME:-nrg}-fe-data

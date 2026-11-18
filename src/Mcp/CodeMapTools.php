@@ -29,6 +29,19 @@ final readonly class CodeMapTools
         'index_status' => ['indexStatus', 'Index freshness: file and symbol counts, last scan time, files that failed to parse.'],
     ];
 
+    /**
+     * Descriptions that differ when the index holds a TypeScript project (same tools, same parameters).
+     */
+    public const array TS_DESCRIPTIONS = [
+        'find_usages' => 'Who imports / renders / calls / references an exported symbol (component, function, class, interface, type, enum, const) or one of its members, with file:line. JSX usages (<Button>), imports, calls, new, type references and re-exports are all included. With a member it also shows the member\'s signature, what it calls, overrides in subtypes, and calls of the same method name on values of unknown type. Short names work (e.g. "Button", "useCart", "OrderService::create"). Production code is listed first, then tests, stories and generated code; the header gives the total, page with offset, and drop noise with exclude="tests,stories,generated".',
+        'class_outline' => 'Outline of a class, interface, type, enum, component or function: extends/implements, decorators, properties (incl. constructor parameter properties), methods with line numbers. Pass a .ts/.tsx path to outline a whole file. Short names work. Much cheaper than reading the file.',
+        'find_implementations' => 'All subtypes of a class or interface: implementing classes, subclasses and extending interfaces, transitively, with file:line. Short names work.',
+        'callees' => 'What a function, component or method references: calls, rendered JSX components, instantiations, type references. Pass "Name" or "Class::method".',
+        'find_by_attribute' => 'Symbols carrying a TypeScript decorator (e.g. injectable, Component, Input), optionally filtered by text in the decorator arguments.',
+        'search_symbols' => 'Find components, functions, classes, interfaces, types, enums, consts and members by partial name or doc words (camelCase-aware: "useCart", "order status"). Exact names rank first, then prefixes, then substrings; production code before tests, stories and generated code (exclude="tests,stories,generated" drops them). Only needed when you do not know a name; the other tools accept short names directly.',
+        'namespace_tree' => 'Directory (module) hierarchy with top-level symbol counts, for orientation in an unfamiliar area. Accepts "apps/customer/app" or "apps\\customer\\app".',
+    ];
+
     public function __construct(private CodeQuery $query)
     {
     }
@@ -36,11 +49,13 @@ final readonly class CodeMapTools
     /**
      * @param string      $fqcn   Class, interface, trait, enum or function; short name or fully-qualified
      * @param string|null $member Optional member: method name, constant name or $property
-     * @param int         $limit  Maximum results (1-500)
+     * @param int         $limit   Maximum results per page (1-500)
+     * @param int         $offset  Skip this many results (paging; the header shows the total and the next offset)
+     * @param string|null $exclude Leave out files of these kinds, comma-separated: tests, stories, generated
      */
-    public function findUsages(string $fqcn, ?string $member = null, int $limit = 100): string
+    public function findUsages(string $fqcn, ?string $member = null, int $limit = 100, int $offset = 0, ?string $exclude = null): string
     {
-        return $this->query->findUsages($fqcn, $member, $limit);
+        return $this->query->findUsages($fqcn, $member, $limit, $offset, $exclude);
     }
 
     /**
@@ -83,15 +98,16 @@ final readonly class CodeMapTools
     /**
      * @param string      $query Words or partial names, e.g. "invoice pdf" or "ContractRepo"
      * @param string|null $kind  Restrict to one kind: class, interface, trait, enum, method, property, constant, case, function
-     * @param int         $limit Maximum results (1-200)
+     * @param int         $limit   Maximum results (1-200)
+     * @param string|null $exclude Leave out files of these kinds, comma-separated: tests, stories, generated
      */
-    public function searchSymbols(string $query, ?string $kind = null, int $limit = 10): string
+    public function searchSymbols(string $query, ?string $kind = null, int $limit = 10, ?string $exclude = null): string
     {
-        return $this->query->searchSymbols($query, $kind, $limit);
+        return $this->query->searchSymbols($query, $kind, $limit, $exclude);
     }
 
     /**
-     * @param string $prefix Only show this namespace and below, e.g. App\Domain
+     * @param string $prefix Only show this namespace and below, e.g. App\Domain (TypeScript: a directory path, "/" or "\" separated)
      * @param int    $depth  Levels to show below the prefix
      */
     public function namespaceTree(string $prefix = '', int $depth = 3): string

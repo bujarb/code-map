@@ -16,12 +16,18 @@ final class ServerFactory
 
     public static function create(Database $db, ?string $sessionDir = null): Server
     {
-        $tools = new CodeMapTools(new CodeQuery($db));
+        $query = new CodeQuery($db);
+        $tools = new CodeMapTools($query);
+        $ts = 'ts' === $query->lang();
 
         $builder = Server::builder()
             ->setServerInfo('php-code-map', self::VERSION)
-            ->setInstructions(
-                'Structural index of this PHP codebase, built from the AST and refreshed within seconds of file changes. '
+            ->setInstructions($ts
+                ? 'Structural index of this TypeScript/React codebase, built with the TypeScript compiler (tsconfig paths resolved) and refreshed within seconds of file changes. '
+                    .'Prefer these tools over grep for "where is this component rendered / who imports or calls X / what implements X" and for outlines. '
+                    .'Symbols are named "dir\\file\\Name", but short names work everywhere, so call the tool directly instead of searching first; one call is usually the full answer. '
+                    .'Results include path:line, so read only those lines and do not re-check the same question with grep.'
+                : 'Structural index of this PHP codebase, built from the AST and refreshed within seconds of file changes. '
                 .'Prefer these tools over grep for "who calls / where is X used / what implements X / which routes" and for class outlines. '
                 .'Short class names work everywhere, so call the tool directly instead of searching first; one call is usually the full answer. '
                 .'Results include path:line, so read only those lines and do not re-check the same question with grep.',
@@ -39,6 +45,9 @@ final class ServerFactory
             ? null
             : ['anthropic/alwaysLoad' => true];
         foreach (CodeMapTools::TOOLS as $name => [$method, $description]) {
+            if ($ts) {
+                $description = CodeMapTools::TS_DESCRIPTIONS[$name] ?? $description;
+            }
             $builder->addTool([$tools, $method], $name, description: $description, annotations: $readOnly, meta: $meta);
         }
 

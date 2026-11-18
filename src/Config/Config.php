@@ -23,9 +23,27 @@ final readonly class Config
     ];
 
     /**
+     * Added to DEFAULT_EXCLUDES in TypeScript mode: build output, caches and package-manager stores.
+     */
+    public const array TS_EXCLUDES = [
+        'dist',
+        'build',
+        '.next',
+        'coverage',
+        '.nx',
+        '.turbo',
+        '.cache',
+        '.pnpm-store',
+        '.yarn',
+    ];
+
+    public const array LANGUAGES = ['php', 'ts'];
+
+    /**
      * @param list<string> $include  directories (relative to the project root) to scan
      * @param list<string> $exclude  directory names, or relative path globs when they contain a "/"
      * @param list<string> $allowedHosts Host headers the MCP HTTP endpoint accepts
+     * @param string       $lang         "php" or "ts": which parser indexes the project
      */
     public function __construct(
         public string $projectRoot,
@@ -39,7 +57,39 @@ final readonly class Config
         public string $httpHost = '0.0.0.0',
         public int $httpPort = 8765,
         public array $allowedHosts = ['localhost', '127.0.0.1', '[::1]'],
+        public string $lang = 'php',
     ) {
+        if (!\in_array($lang, self::LANGUAGES, true)) {
+            throw new \InvalidArgumentException("Unsupported CODEMAP_LANG \"{$lang}\"; use php, ts or auto.");
+        }
+    }
+
+    /**
+     * @return list<string> file extensions (without dot) the indexer picks up
+     */
+    public function extensions(): array
+    {
+        return 'ts' === $this->lang ? ['ts', 'tsx', 'mts', 'cts'] : ['php'];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function defaultExcludes(string $lang): array
+    {
+        return 'ts' === $lang ? [...self::DEFAULT_EXCLUDES, ...self::TS_EXCLUDES] : self::DEFAULT_EXCLUDES;
+    }
+
+    /**
+     * "auto" picks PHP when the root has a composer.json, TypeScript when it has a tsconfig.json or package.json.
+     */
+    public static function detectLanguage(string $root): string
+    {
+        if (is_file($root.'/composer.json')) {
+            return 'php';
+        }
+
+        return is_file($root.'/tsconfig.json') || is_file($root.'/package.json') ? 'ts' : 'php';
     }
 
     /**
@@ -60,10 +110,15 @@ final readonly class Config
             ? null
             : array_values(array_filter(array_map('trim', explode(',', $value)), static fn (string $v) => '' !== $v));
 
+        $lang = strtolower(trim((string) ($env['CODEMAP_LANG'] ?? $file['lang'] ?? 'php'))) ?: 'php';
+        if ('auto' === $lang) {
+            $lang = self::detectLanguage($root);
+        }
+
         $include = $list($env['CODEMAP_INCLUDE'] ?? null) ?? $file['include'] ?? ['.'];
         // User excludes extend the defaults rather than replace them; replacing would make it easy to index vendor/ by accident.
         $exclude = array_values(array_unique([
-            ...self::DEFAULT_EXCLUDES,
+            ...self::defaultExcludes($lang),
             ...($file['exclude'] ?? []),
             ...($list($env['CODEMAP_EXCLUDE'] ?? null) ?? []),
         ]));
@@ -82,6 +137,7 @@ final readonly class Config
             httpHost: $env['CODEMAP_HTTP_HOST'] ?? '0.0.0.0',
             httpPort: (int) ($env['CODEMAP_HTTP_PORT'] ?? 8765),
             allowedHosts: $list($env['CODEMAP_ALLOWED_HOSTS'] ?? null) ?? ['localhost', '127.0.0.1', '[::1]'],
+            lang: $lang,
         );
     }
 }

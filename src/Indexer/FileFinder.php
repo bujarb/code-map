@@ -20,6 +20,7 @@ final readonly class FileFinder
     public function find(): array
     {
         $root = $this->config->projectRoot;
+        $extensions = $this->config->extensions();
         $files = [];
 
         foreach ($this->config->include as $dir) {
@@ -37,7 +38,7 @@ final readonly class FileFinder
                     new \RecursiveDirectoryIterator($base, \FilesystemIterator::SKIP_DOTS | \FilesystemIterator::CURRENT_AS_FILEINFO),
                     fn (\SplFileInfo $file) => $file->isDir()
                         ? !$file->isLink() && !$this->isExcluded($this->relative($file->getPathname(), $root), $file->getFilename())
-                        : 'php' === $file->getExtension(),
+                        : \in_array($file->getExtension(), $extensions, true),
                 ),
                 \RecursiveIteratorIterator::LEAVES_ONLY,
                 \RecursiveIteratorIterator::CATCH_GET_CHILD, // unreadable dirs are skipped instead of aborting the scan
